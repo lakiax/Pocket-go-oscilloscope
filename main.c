@@ -341,7 +341,7 @@ int main(int argc, char* argv[]) {
 
             if (state.show_exit_dialog) {
                 if (event.type == SDL_KEYDOWN) {
-                    if (event.key.keysym.sym == SDLK_LCTRL) running = 0; 
+                    if (event.key.keysym.sym == SDLK_LALT) running = 0; 
                     else {
                         state.show_exit_dialog = 0;
                         state.start_handled = 1;
