@@ -7,7 +7,8 @@
 #include <SDL/SDL.h>
 #include "serial_hal.h"
 #include "font.h" 
-#include "cursor_pusher.h" // [新增] 引入小人推光标模块
+#include "cursor_pusher.h" // 引入小人推光标模块
+#include "audio_player.h"  // [新增] 引入音频模块
 
 // --- 基础配置 ---
 #define SCREEN_WIDTH  320
@@ -22,7 +23,7 @@
 #define MEASURE_WIN_H   82
 #define MEASURE_WIN_X   (SCREEN_WIDTH - MEASURE_WIN_W - 2)
 #define MEASURE_WIN_Y   2
-#define MEASURE_WIN_ALPHA 128 // [新增] 测量窗口背景透明度 (0:全透 - 255:不透)
+#define MEASURE_WIN_ALPHA 128 // 测量窗口背景透明度 (0:全透 - 255:不透)
 
 // --- 颜色定义 ---
 #define RGB565(r, g, b) ((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
@@ -80,8 +81,7 @@ AppState state = {
     CENTER_Y 
 };
 
-// --- [关键修复] 函数前向声明 ---
-// 必须在被调用前声明，否则会出现 implicit declaration 错误
+// --- 函数前向声明 ---
 float pixel_to_time(int x);
 float pixel_to_volt(int y);
 
@@ -287,34 +287,6 @@ void send_timebase_command(int idx) {
     for (int i = 0; i < SCREEN_WIDTH; i++) data_buffer[i] = 0;
 }
 
-void show_loading_animation(SDL_Surface* screen) {
-    SDL_Surface* sprite = SDL_LoadBMP("walk.bmp");
-    int use_sprite = (sprite != NULL);
-    int sprite_w = 32; int sprite_h = 32; int num_frames = 4;
-    if (use_sprite) SDL_SetColorKey(sprite, SDL_SRCCOLORKEY, SDL_MapRGB(sprite->format, 255, 0, 255));
-    int progress_y = CENTER_Y; int bar_height = 6;
-    for (int i = 0; i <= 100; i++) {
-        SDL_FillRect(screen, NULL, COLOR_BG);
-        int margin = 20; int max_width = SCREEN_WIDTH - 2 * margin;
-        int current_width = (i * max_width) / 100; int current_x = margin + current_width;
-        SDL_Rect trail = {margin, progress_y, current_width, bar_height};
-        SDL_FillRect(screen, &trail, COLOR_LOAD_TRAIL);
-        if (use_sprite) {
-            int frame_idx = (i / 5) % num_frames; 
-            SDL_Rect src_rect = {frame_idx * sprite_w, 0, sprite_w, sprite_h};
-            SDL_Rect dst_rect = {current_x - (sprite_w / 2), progress_y - sprite_h + 2, 0, 0};
-            SDL_BlitSurface(sprite, &src_rect, screen, &dst_rect);
-        } else {
-            SDL_Rect box = {current_x - 5, progress_y - 20, 10, 20};
-            SDL_FillRect(screen, &box, COLOR_TEXT);
-        }
-        draw_text_f(screen, CENTER_X - 20, progress_y + 15, COLOR_TEXT, "LOADING %d%%", i);
-        SDL_Flip(screen); SDL_Delay(20); 
-    }
-    if (use_sprite) SDL_FreeSurface(sprite);
-    SDL_Delay(200);
-}
-
 #define FRAME_HEADER_SIZE 2
 #define DATA_POINTS       SCREEN_WIDTH
 #define FRAME_DATA_SIZE   (DATA_POINTS * 2)
@@ -324,26 +296,49 @@ uint8_t rx_buffer[FRAME_SIZE * 2];
 int rx_len = 0;
 
 int main(int argc, char* argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) return 1;
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) return 1; // [修改] 增加音频初始化
     SDL_ShowCursor(SDL_DISABLE); 
     SDL_EnableKeyRepeat(300, 30);
     SDL_Surface* screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, 16, SDL_SWSURFACE);
     
+    // [新增] 初始化音频
+    if (Audio_Init("key_sound.wav") != 0) {
+        printf("Warning: Audio init failed. Ensure key_sound.wav exists.\n");
+    }
+
     // [新增] 初始化小人资源
     if (Pusher_Init() != 0) {
         printf("Pusher Init Failed (check walk.bmp)\n");
     }
 
-    show_loading_animation(screen);
 
     int running = 1;
     for (int i = 0; i < SCREEN_WIDTH; i++) data_buffer[i] = 0;
+
+    // [新增] 按键状态数组，用于过滤长按重复音效
+    Uint8 key_press_flags[SDLK_LAST];
+    memset(key_press_flags, 0, sizeof(key_press_flags));
 
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) running = 0;
             
+            // --- [新增] 全局音效与长按过滤逻辑 ---
+            if (event.type == SDL_KEYDOWN) {
+                // 如果该键之前未按下（防止长按重复触发），则播放
+                if (event.key.keysym.sym < SDLK_LAST && key_press_flags[event.key.keysym.sym] == 0) {
+                    Audio_Play();
+                    key_press_flags[event.key.keysym.sym] = 1; // 标记为按下
+                }
+            } else if (event.type == SDL_KEYUP) {
+                // 松开按键，重置标志位
+                if (event.key.keysym.sym < SDLK_LAST) {
+                    key_press_flags[event.key.keysym.sym] = 0;
+                }
+            }
+            // ------------------------------------
+
             if (state.show_exit_dialog) {
                 if (event.type == SDL_KEYDOWN) {
                     if (event.key.keysym.sym == SDLK_LCTRL) running = 0; 
@@ -475,6 +470,8 @@ int main(int argc, char* argv[]) {
     
     // [新增] 释放小人资源
     Pusher_Cleanup();
+    // [新增] 释放音频资源
+    Audio_Cleanup();
     
     if (serial_fd != -1) serial_close(serial_fd);
     SDL_Quit();

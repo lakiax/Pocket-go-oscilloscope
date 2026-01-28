@@ -7,7 +7,7 @@ TARGET = scope_app
 
 # --- 源文件列表 ---
 # 包含主程序、串口驱动(已集成激活逻辑)和数据解析器
-SRC = main.c serial_hal.c cursor_pusher.c
+SRC = main.c serial_hal.c cursor_pusher.c audio_player.c
 
 # ==========================================
 # 编译环境配置
