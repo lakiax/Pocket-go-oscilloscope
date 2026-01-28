@@ -6,7 +6,8 @@
 #include <stdarg.h>
 #include <SDL/SDL.h>
 #include "serial_hal.h"
-#include "font.h"  // 引用字库
+#include "font.h" 
+#include "cursor_pusher.h" // [新增] 引入小人推光标模块
 
 // --- 基础配置 ---
 #define SCREEN_WIDTH  320
@@ -17,14 +18,15 @@
 #define GRID_SIZE     30
 #define CENTER_X      (SCREEN_WIDTH / 2)
 #define CENTER_Y      (SCREEN_HEIGHT / 2)
-#define MEASURE_WIN_W   94
+#define MEASURE_WIN_W   80
 #define MEASURE_WIN_H   82
 #define MEASURE_WIN_X   (SCREEN_WIDTH - MEASURE_WIN_W - 2)
-#define MEASURE_WIN_Y   25
+#define MEASURE_WIN_Y   2
+#define MEASURE_WIN_ALPHA 128 // [新增] 测量窗口背景透明度 (0:全透 - 255:不透)
 
 // --- 颜色定义 ---
 #define RGB565(r, g, b) ((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
-#define COLOR_BG        RGB565(0, 0, 0)       
+#define COLOR_BG        RGB565(50, 50, 50)       
 #define COLOR_GRID      RGB565(60, 60, 60)    
 #define COLOR_AXIS      RGB565(120, 120, 120) 
 #define COLOR_WAVE      RGB565(0, 255, 0)     
@@ -38,6 +40,7 @@
 #define COLOR_OVERLAY   RGB565(20, 20, 40)    
 #define COLOR_ALERT_BG  RGB565(50, 0, 0)      
 #define COLOR_ZERO_LINE RGB565(0, 100, 255)
+#define COLOR_LOAD_TRAIL RGB565(0, 200, 255) 
 
 // --- 状态结构 ---
 typedef struct {
@@ -63,10 +66,9 @@ float TIME_PER_DIV[] = {0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f, 50.0f, 100.0f, 200
 const char* TIME_DIV_STRS[] = {"500us", "1ms", "2ms", "5ms", "10ms", "20ms", "50ms", "100ms", "200ms", "500ms"};
 const int TIME_LEVELS = 10;
 
-// --- 全局变量 ---
-int data_buffer[SCREEN_WIDTH]; // 屏幕波形数据
+int data_buffer[SCREEN_WIDTH]; 
 int serial_fd = -1;
-Uint32 last_packet_time = 0;   // 最后一次收到数据的时间 (用于心跳判断)
+Uint32 last_packet_time = 0;   
 
 AppState state = {
     0, 0, 
@@ -77,6 +79,11 @@ AppState state = {
     0, 0, 0, 0,
     CENTER_Y 
 };
+
+// --- [关键修复] 函数前向声明 ---
+// 必须在被调用前声明，否则会出现 implicit declaration 错误
+float pixel_to_time(int x);
+float pixel_to_volt(int y);
 
 // --- 绘图函数 ---
 void put_pixel(SDL_Surface* screen, int x, int y, Uint16 color) {
@@ -112,11 +119,9 @@ void draw_text_f(SDL_Surface* screen, int x, int y, Uint16 color, const char* fm
 void draw_dotted_v(SDL_Surface* screen, int x, Uint16 color) {
     for (int y = 0; y < SCREEN_HEIGHT; y++) if (y % 4 < 2) put_pixel(screen, x, y, color);
 }
-
 void draw_dotted_h(SDL_Surface* screen, int y, Uint16 color) {
     for (int x = 0; x < SCREEN_WIDTH; x++) if (x % 4 < 2) put_pixel(screen, x, y, color);
 }
-
 void draw_zero_arrow(SDL_Surface* screen, int y, Uint16 color) {
     for (int h = 0; h <= 4; h++) {
         int width = 8 - (h * 2); 
@@ -128,77 +133,48 @@ void draw_zero_arrow(SDL_Surface* screen, int y, Uint16 color) {
         }
     }
 }
-
 void draw_grid(SDL_Surface* screen) {
     if (SDL_MUSTLOCK(screen)) SDL_LockSurface(screen);
-    
-    // 1. 绘制虚线网格
     for (int x = CENTER_X; x < SCREEN_WIDTH; x += GRID_SIZE) draw_dotted_v(screen, x, COLOR_GRID);
     for (int x = CENTER_X; x >= 0; x -= GRID_SIZE) draw_dotted_v(screen, x, COLOR_GRID);
     for (int y = CENTER_Y; y < SCREEN_HEIGHT; y += GRID_SIZE) draw_dotted_h(screen, y, COLOR_GRID);
     for (int y = CENTER_Y; y >= 0; y -= GRID_SIZE) draw_dotted_h(screen, y, COLOR_GRID);
-    
-    // 2. 绘制中心坐标轴实线
     for (int x = 0; x < SCREEN_WIDTH; x++) put_pixel(screen, x, CENTER_Y, COLOR_AXIS);
     for (int y = 0; y < SCREEN_HEIGHT; y++) put_pixel(screen, CENTER_X, y, COLOR_AXIS);
-
-    // 3. 绘制刻度 (大刻度 + 小刻度)
-    // 每一个 GRID_SIZE 分为 4 等分
-    float step = GRID_SIZE / 4.0f;
     
-    // --- X轴刻度 (在水平轴上画短竖线) ---
-    // 从中心向两侧辐射
+    // 刻度绘制
+    float step = GRID_SIZE / 4.0f;
     for (int i = 1; ; i++) {
         int offset = (int)(i * step);
-        if (CENTER_X + offset >= SCREEN_WIDTH && CENTER_X - offset < 0) break; // 超出屏幕停止
-
-        // 判定是大刻度还是小刻度
-        // i % 4 == 0 对应整网格位置，即大刻度
+        if (CENTER_X + offset >= SCREEN_WIDTH && CENTER_X - offset < 0) break; 
         int tick_len = (i % 4 == 0) ? 4 : 2; 
-
-        // 右侧刻度
         if (CENTER_X + offset < SCREEN_WIDTH) {
-            for (int h = -tick_len; h <= tick_len; h++) 
-                put_pixel(screen, CENTER_X + offset, CENTER_Y + h, COLOR_AXIS);
+            for (int h = -tick_len; h <= tick_len; h++) put_pixel(screen, CENTER_X + offset, CENTER_Y + h, COLOR_AXIS);
         }
-        // 左侧刻度
         if (CENTER_X - offset >= 0) {
-            for (int h = -tick_len; h <= tick_len; h++) 
-                put_pixel(screen, CENTER_X - offset, CENTER_Y + h, COLOR_AXIS);
+            for (int h = -tick_len; h <= tick_len; h++) put_pixel(screen, CENTER_X - offset, CENTER_Y + h, COLOR_AXIS);
         }
     }
-
-    // --- Y轴刻度 (在垂直轴上画短横线) ---
-    // 从中心向上下辐射
     for (int i = 1; ; i++) {
         int offset = (int)(i * step);
         if (CENTER_Y + offset >= SCREEN_HEIGHT && CENTER_Y - offset < 0) break;
-
         int tick_len = (i % 4 == 0) ? 4 : 2;
-
-        // 下方刻度
         if (CENTER_Y + offset < SCREEN_HEIGHT) {
-            for (int w = -tick_len; w <= tick_len; w++) 
-                put_pixel(screen, CENTER_X + w, CENTER_Y + offset, COLOR_AXIS);
+            for (int w = -tick_len; w <= tick_len; w++) put_pixel(screen, CENTER_X + w, CENTER_Y + offset, COLOR_AXIS);
         }
-        // 上方刻度
         if (CENTER_Y - offset >= 0) {
-            for (int w = -tick_len; w <= tick_len; w++) 
-                put_pixel(screen, CENTER_X + w, CENTER_Y - offset, COLOR_AXIS);
+            for (int w = -tick_len; w <= tick_len; w++) put_pixel(screen, CENTER_X + w, CENTER_Y - offset, COLOR_AXIS);
         }
     }
 
-    // 4. 绘制基准零位指示
     if (state.zero_pos_y >= 0 && state.zero_pos_y < SCREEN_HEIGHT) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-             if (x % 4 < 2) put_pixel(screen, x, state.zero_pos_y, COLOR_ZERO_LINE);
-        }
+        for (int x = 0; x < SCREEN_WIDTH; x++) { if (x % 4 < 2) put_pixel(screen, x, state.zero_pos_y, COLOR_ZERO_LINE); }
         draw_zero_arrow(screen, state.zero_pos_y, COLOR_ZERO_LINE);
     }
-    
     if (SDL_MUSTLOCK(screen)) SDL_UnlockSurface(screen);
 }
 
+// --- 计算函数实现 ---
 float pixel_to_time(int x) {
     float time_per_px = TIME_PER_DIV[state.time_div_idx] / (float)GRID_SIZE;
     return (float)(x - CENTER_X) * time_per_px;
@@ -220,17 +196,35 @@ void draw_measurements(SDL_Surface* screen) {
     for (int x=0; x<SCREEN_WIDTH; x+=2) { put_pixel(screen, x, state.cursor_y1, cy1); put_pixel(screen, x, state.cursor_y2, cy2); }
     if (SDL_MUSTLOCK(screen)) SDL_UnlockSurface(screen);
     
-    SDL_Rect rect = {MEASURE_WIN_X, MEASURE_WIN_Y, MEASURE_WIN_W, MEASURE_WIN_H};
-    SDL_FillRect(screen, &rect, COLOR_OVERLAY);
-    int tx = rect.x + 5, ty = rect.y + 5;
-    float t1 = pixel_to_time(state.cursor_x1);
-    float t2 = pixel_to_time(state.cursor_x2);
+    // --- [修改] 使用 Alpha 混合绘制半透明背景 ---
+    SDL_Rect dst_rect = {MEASURE_WIN_X, MEASURE_WIN_Y, MEASURE_WIN_W, MEASURE_WIN_H};
+    
+    // 创建一个临时 Surface
+    SDL_Surface* bg_surf = SDL_CreateRGBSurface(SDL_SWSURFACE, 
+                                                MEASURE_WIN_W, MEASURE_WIN_H, 
+                                                screen->format->BitsPerPixel,
+                                                screen->format->Rmask,
+                                                screen->format->Gmask,
+                                                screen->format->Bmask,
+                                                0);
+    if (bg_surf) {
+        // 填充背景色
+        SDL_FillRect(bg_surf, NULL, COLOR_OVERLAY);
+        // 设置 Alpha 值
+        SDL_SetAlpha(bg_surf, SDL_SRCALPHA, MEASURE_WIN_ALPHA);
+        // Blit 到屏幕
+        SDL_BlitSurface(bg_surf, NULL, screen, &dst_rect);
+        // 释放
+        SDL_FreeSurface(bg_surf);
+    }
+    // ------------------------------------------
+
+    int tx = MEASURE_WIN_X + 5, ty = MEASURE_WIN_Y + 5;
+    float t1 = pixel_to_time(state.cursor_x1); float t2 = pixel_to_time(state.cursor_x2);
     draw_text_f(screen, tx, ty, (state.active_cursor==0)?COLOR_CURSOR_SEL:COLOR_TEXT, "X1: %.2fms", t1);
     draw_text_f(screen, tx, ty+10, (state.active_cursor==1)?COLOR_CURSOR_SEL:COLOR_TEXT, "X2: %.2fms", t2);
     draw_text_f(screen, tx, ty+20, COLOR_TEXT, "dX: %.2fms", t2-t1);
-    
-    float v1 = pixel_to_volt(state.cursor_y1);
-    float v2 = pixel_to_volt(state.cursor_y2);
+    float v1 = pixel_to_volt(state.cursor_y1); float v2 = pixel_to_volt(state.cursor_y2);
     draw_text_f(screen, tx, ty+38, (state.active_cursor==2)?COLOR_CURSOR_SEL:COLOR_TEXT, "Y1: %.2fV", v1);
     draw_text_f(screen, tx, ty+48, (state.active_cursor==3)?COLOR_CURSOR_SEL:COLOR_TEXT, "Y2: %.2fV", v2);
     draw_text_f(screen, tx, ty+58, COLOR_TEXT, "dY: %.2fV", v2-v1);
@@ -247,44 +241,35 @@ void draw_exit_dialog(SDL_Surface* screen) {
 void draw_ui(SDL_Surface* screen, int connected) {
     SDL_FillRect(screen, NULL, COLOR_BG);
     draw_grid(screen); 
-    
     if (SDL_MUSTLOCK(screen)) SDL_LockSurface(screen);
-    
     float mv_per_div = VOLT_PER_DIV[state.volt_div_idx] * 1000.0f;
     float pixels_per_mv = (float)GRID_SIZE / mv_per_div;
-    
     for (int x = 0; x < SCREEN_WIDTH - 1; x++) {
         int mv_val = data_buffer[x];
         int mv_next = data_buffer[x+1];
-        
         int scaled_y = state.zero_pos_y - (int)(mv_val * pixels_per_mv);
         int scaled_next = state.zero_pos_y - (int)(mv_next * pixels_per_mv);
-        
         if (scaled_y >= 0 && scaled_y < SCREEN_HEIGHT) {
             put_pixel(screen, x, scaled_y, COLOR_WAVE);
             if (abs(scaled_next - scaled_y) > 1 && abs(scaled_next - scaled_y) < SCREEN_HEIGHT) {
                 int step = (scaled_next > scaled_y) ? 1 : -1;
-                for (int k = scaled_y; k != scaled_next; k += step) 
-                    if (k>=0 && k<SCREEN_HEIGHT) put_pixel(screen, x, k, COLOR_WAVE);
+                for (int k = scaled_y; k != scaled_next; k += step) if (k>=0 && k<SCREEN_HEIGHT) put_pixel(screen, x, k, COLOR_WAVE);
             }
         }
     }
     if (SDL_MUSTLOCK(screen)) SDL_UnlockSurface(screen);
     
     draw_measurements(screen);
-    draw_exit_dialog(screen);
     
-    SDL_Rect bar = {0, SCREEN_HEIGHT - 20, SCREEN_WIDTH, 20}; SDL_FillRect(screen, &bar, COLOR_BAR_BG);
-    
-    // --- 状态灯逻辑优化 ---
-    // 暂停: 黄色 | 连接且活跃: 绿色 | 断开: 红色
-    Uint16 stat_color = COLOR_STATUS_NO;
-    if (state.paused) {
-        stat_color = COLOR_STATUS_PAUSE;
-    } else if (connected) {
-        stat_color = COLOR_STATUS_OK;
+    // [新增] 绘制推光标的小人 (集成)
+    if (state.show_measure) {
+        Pusher_Render(screen);
     }
-    
+
+    draw_exit_dialog(screen);
+    SDL_Rect bar = {0, SCREEN_HEIGHT - 20, SCREEN_WIDTH, 20}; SDL_FillRect(screen, &bar, COLOR_BAR_BG);
+    Uint16 stat_color = COLOR_STATUS_NO;
+    if (state.paused) stat_color = COLOR_STATUS_PAUSE; else if (connected) stat_color = COLOR_STATUS_OK;
     SDL_Rect stat = {5, SCREEN_HEIGHT - 14, 8, 8}; SDL_FillRect(screen, &stat, stat_color);
     draw_text_f(screen, 20, SCREEN_HEIGHT - 13, COLOR_TEXT, "Time:%s", TIME_DIV_STRS[state.time_div_idx]);
     draw_text_f(screen, 100, SCREEN_HEIGHT - 13, COLOR_TEXT, "Volt:%s", VOLT_DIV_STRS[state.volt_div_idx]);
@@ -295,18 +280,47 @@ void send_timebase_command(int idx) {
     if (serial_fd == -1) return;
     char cmd_buf[32];
     int len = snprintf(cmd_buf, sizeof(cmd_buf), "TIM:%d\n", idx);
-    write(serial_fd, cmd_buf, len);
-    // 清空本地波形，防止旧时基残留
+    // [修复] 消除 warning: ignoring return value of ‘write’
+    if (write(serial_fd, cmd_buf, len) != len) {
+        // 可以在这里处理错误，或者直接忽略
+    }
     for (int i = 0; i < SCREEN_WIDTH; i++) data_buffer[i] = 0;
 }
 
-// 帧定义: [FA] [FB] [DATA_0_L] [DATA_0_H] ... [DATA_319_L] [DATA_319_H]
+void show_loading_animation(SDL_Surface* screen) {
+    SDL_Surface* sprite = SDL_LoadBMP("walk.bmp");
+    int use_sprite = (sprite != NULL);
+    int sprite_w = 32; int sprite_h = 32; int num_frames = 4;
+    if (use_sprite) SDL_SetColorKey(sprite, SDL_SRCCOLORKEY, SDL_MapRGB(sprite->format, 255, 0, 255));
+    int progress_y = CENTER_Y; int bar_height = 6;
+    for (int i = 0; i <= 100; i++) {
+        SDL_FillRect(screen, NULL, COLOR_BG);
+        int margin = 20; int max_width = SCREEN_WIDTH - 2 * margin;
+        int current_width = (i * max_width) / 100; int current_x = margin + current_width;
+        SDL_Rect trail = {margin, progress_y, current_width, bar_height};
+        SDL_FillRect(screen, &trail, COLOR_LOAD_TRAIL);
+        if (use_sprite) {
+            int frame_idx = (i / 5) % num_frames; 
+            SDL_Rect src_rect = {frame_idx * sprite_w, 0, sprite_w, sprite_h};
+            SDL_Rect dst_rect = {current_x - (sprite_w / 2), progress_y - sprite_h + 2, 0, 0};
+            SDL_BlitSurface(sprite, &src_rect, screen, &dst_rect);
+        } else {
+            SDL_Rect box = {current_x - 5, progress_y - 20, 10, 20};
+            SDL_FillRect(screen, &box, COLOR_TEXT);
+        }
+        draw_text_f(screen, CENTER_X - 20, progress_y + 15, COLOR_TEXT, "LOADING %d%%", i);
+        SDL_Flip(screen); SDL_Delay(20); 
+    }
+    if (use_sprite) SDL_FreeSurface(sprite);
+    SDL_Delay(200);
+}
+
 #define FRAME_HEADER_SIZE 2
 #define DATA_POINTS       SCREEN_WIDTH
 #define FRAME_DATA_SIZE   (DATA_POINTS * 2)
 #define FRAME_SIZE        (FRAME_HEADER_SIZE + FRAME_DATA_SIZE)
 
-uint8_t rx_buffer[FRAME_SIZE * 2]; // 双倍缓冲防止溢出
+uint8_t rx_buffer[FRAME_SIZE * 2]; 
 int rx_len = 0;
 
 int main(int argc, char* argv[]) {
@@ -315,6 +329,13 @@ int main(int argc, char* argv[]) {
     SDL_EnableKeyRepeat(300, 30);
     SDL_Surface* screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, 16, SDL_SWSURFACE);
     
+    // [新增] 初始化小人资源
+    if (Pusher_Init() != 0) {
+        printf("Pusher Init Failed (check walk.bmp)\n");
+    }
+
+    show_loading_animation(screen);
+
     int running = 1;
     for (int i = 0; i < SCREEN_WIDTH; i++) data_buffer[i] = 0;
 
@@ -361,15 +382,35 @@ int main(int argc, char* argv[]) {
                 if (state.show_measure) {
                     if (key == SDLK_TAB || key == SDLK_BACKSPACE) state.active_cursor = (state.active_cursor + 1) % 4;
                     int* target = NULL;
-                    if (state.active_cursor == 0) target = &state.cursor_x1;
-                    else if (state.active_cursor == 1) target = &state.cursor_x2;
-                    else if (state.active_cursor == 2) target = &state.cursor_y1;
-                    else if (state.active_cursor == 3) target = &state.cursor_y2;
                     int step = 1;
-                    if (key == SDLK_UP && (state.active_cursor >= 2)) *target -= step;
-                    if (key == SDLK_DOWN && (state.active_cursor >= 2)) *target += step;
-                    if (key == SDLK_LEFT && (state.active_cursor < 2)) *target -= step;
-                    if (key == SDLK_RIGHT && (state.active_cursor < 2)) *target += step;
+                    
+                    // [新增] 用于小人推动的变量
+                    int moved = 0;      // 标记是否移动
+                    int move_delta = 0; // 移动距离
+                    CursorType move_type = CURSOR_TYPE_X; // 移动的光标类型
+
+                    if (state.active_cursor == 0) { target = &state.cursor_x1; move_type = CURSOR_TYPE_X; }
+                    else if (state.active_cursor == 1) { target = &state.cursor_x2; move_type = CURSOR_TYPE_X; }
+                    else if (state.active_cursor == 2) { target = &state.cursor_y1; move_type = CURSOR_TYPE_Y; }
+                    else if (state.active_cursor == 3) { target = &state.cursor_y2; move_type = CURSOR_TYPE_Y; }
+
+                    if (key == SDLK_UP && (state.active_cursor >= 2)) { 
+                        *target -= step; moved = 1; move_delta = -step;
+                    }
+                    if (key == SDLK_DOWN && (state.active_cursor >= 2)) { 
+                        *target += step; moved = 1; move_delta = step;
+                    }
+                    if (key == SDLK_LEFT && (state.active_cursor < 2)) { 
+                        *target -= step; moved = 1; move_delta = -step;
+                    }
+                    if (key == SDLK_RIGHT && (state.active_cursor < 2)) { 
+                        *target += step; moved = 1; move_delta = step;
+                    }
+                    
+                    // [新增] 如果发生了移动，通知小人模块
+                    if (moved) {
+                        Pusher_OnMove(move_type, *target, move_delta);
+                    }
                 } 
                 else {
                     if (key == SDLK_UP) state.zero_pos_y -= 5;
@@ -399,52 +440,41 @@ int main(int argc, char* argv[]) {
         }
 
         if (!state.paused && serial_fd != -1) {
-            // 读取数据到缓冲尾部
             int n = serial_read_bytes(serial_fd, rx_buffer + rx_len, sizeof(rx_buffer) - rx_len);
             if (n > 0) {
                 rx_len += n;
-                last_packet_time = SDL_GetTicks(); // 更新心跳
+                last_packet_time = SDL_GetTicks(); 
             }
-            
-            // 循环寻找帧头 0xFA 0xFB
             while (rx_len >= FRAME_SIZE) {
                 if (rx_buffer[0] == 0xFA && rx_buffer[1] == 0xFB) {
-                    // 找到帧头，解析后面的数据
                     uint8_t* p = rx_buffer + FRAME_HEADER_SIZE;
                     for (int i = 0; i < SCREEN_WIDTH; i++) {
-                        // 小端序: Low byte, High byte
                         uint16_t val = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
                         data_buffer[i] = (int)val;
                         p += 2;
                     }
-                    
-                    // 移除已处理的帧
                     int remaining = rx_len - FRAME_SIZE;
-                    if (remaining > 0) {
-                        memmove(rx_buffer, rx_buffer + FRAME_SIZE, remaining);
-                    }
+                    if (remaining > 0) memmove(rx_buffer, rx_buffer + FRAME_SIZE, remaining);
                     rx_len = remaining;
                 } else {
-                    // 没对齐，滑动 1 字节寻找
                     memmove(rx_buffer, rx_buffer + 1, rx_len - 1);
                     rx_len--;
                 }
             }
         }
         
-        // --- 心跳状态判定 ---
         int connected = 0;
         if (serial_fd != -1) {
-            // 如果 200ms 内收到过数据，则认为连接活跃
-            if (SDL_GetTicks() - last_packet_time < 200) {
-                connected = 1;
-            }
+            if (SDL_GetTicks() - last_packet_time < 200) connected = 1;
         }
 
         draw_ui(screen, connected);
         SDL_Flip(screen);
         SDL_Delay(10);
     }
+    
+    // [新增] 释放小人资源
+    Pusher_Cleanup();
     
     if (serial_fd != -1) serial_close(serial_fd);
     SDL_Quit();

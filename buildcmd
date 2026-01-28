@@ -1,0 +1,1 @@
+ docker run --rm -v "$(pwd)":/work -w /work miyoocfw/toolchain-shared-uclibc:latest make arm
