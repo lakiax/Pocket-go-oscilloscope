@@ -8,7 +8,7 @@
 #include "serial_hal.h"
 #include "font.h" 
 #include "cursor_pusher.h" // 引入小人推光标模块
-#include "audio_player.h"  // [新增] 引入音频模块
+#include "audio_player.h"  // 引入音频模块
 
 // --- 基础配置 ---
 #define SCREEN_WIDTH  320
@@ -185,6 +185,17 @@ float pixel_to_volt(int y) {
     return (float)(state.zero_pos_y - y) * volt_per_px;
 }
 
+// --- [新增] 绘制标签辅助函数 ---
+// 在指定坐标绘制带背景的小标签
+void draw_cursor_tag(SDL_Surface* screen, int x, int y, const char* text, Uint16 bg_color, Uint16 text_color) {
+    int w = strlen(text) * 6; // 字体宽5+间隔1
+    int h = 8;                // 字体高7+间隔1
+    SDL_Rect rect = {x, y, w, h};
+    // 绘制标签背景，遮挡下面的网格或波形，使文字更清晰
+    SDL_FillRect(screen, &rect, bg_color);
+    draw_string(screen, x, y, text, text_color);
+}
+
 void draw_measurements(SDL_Surface* screen) {
     if (!state.show_measure) return;
     if (SDL_MUSTLOCK(screen)) SDL_LockSurface(screen);
@@ -196,10 +207,18 @@ void draw_measurements(SDL_Surface* screen) {
     for (int x=0; x<SCREEN_WIDTH; x+=2) { put_pixel(screen, x, state.cursor_y1, cy1); put_pixel(screen, x, state.cursor_y2, cy2); }
     if (SDL_MUSTLOCK(screen)) SDL_UnlockSurface(screen);
     
-    // --- [修改] 使用 Alpha 混合绘制半透明背景 ---
-    SDL_Rect dst_rect = {MEASURE_WIN_X, MEASURE_WIN_Y, MEASURE_WIN_W, MEASURE_WIN_H};
+    // --- [修改] 绘制光标标签 (X1/X2 紧贴顶部，Y1/Y2 紧贴左侧) ---
+    // X标签: y坐标设为 0 (最顶端)
+    draw_cursor_tag(screen, state.cursor_x1 - 6, 0, "X1", COLOR_BG, cx1);
+    draw_cursor_tag(screen, state.cursor_x2 - 6, 0, "X2", COLOR_BG, cx2);
     
-    // 创建一个临时 Surface
+    // Y标签: x坐标设为 0 (最左端)
+    draw_cursor_tag(screen, 0, state.cursor_y1 - 4, "Y1", COLOR_BG, cy1);
+    draw_cursor_tag(screen, 0, state.cursor_y2 - 4, "Y2", COLOR_BG, cy2);
+    // -----------------------------------------------------
+
+    // --- 绘制半透明数据窗口 ---
+    SDL_Rect dst_rect = {MEASURE_WIN_X, MEASURE_WIN_Y, MEASURE_WIN_W, MEASURE_WIN_H};
     SDL_Surface* bg_surf = SDL_CreateRGBSurface(SDL_SWSURFACE, 
                                                 MEASURE_WIN_W, MEASURE_WIN_H, 
                                                 screen->format->BitsPerPixel,
@@ -208,16 +227,11 @@ void draw_measurements(SDL_Surface* screen) {
                                                 screen->format->Bmask,
                                                 0);
     if (bg_surf) {
-        // 填充背景色
         SDL_FillRect(bg_surf, NULL, COLOR_OVERLAY);
-        // 设置 Alpha 值
         SDL_SetAlpha(bg_surf, SDL_SRCALPHA, MEASURE_WIN_ALPHA);
-        // Blit 到屏幕
         SDL_BlitSurface(bg_surf, NULL, screen, &dst_rect);
-        // 释放
         SDL_FreeSurface(bg_surf);
     }
-    // ------------------------------------------
 
     int tx = MEASURE_WIN_X + 5, ty = MEASURE_WIN_Y + 5;
     float t1 = pixel_to_time(state.cursor_x1); float t2 = pixel_to_time(state.cursor_x2);
@@ -261,7 +275,6 @@ void draw_ui(SDL_Surface* screen, int connected) {
     
     draw_measurements(screen);
     
-    // [新增] 绘制推光标的小人 (集成)
     if (state.show_measure) {
         Pusher_Render(screen);
     }
@@ -280,9 +293,7 @@ void send_timebase_command(int idx) {
     if (serial_fd == -1) return;
     char cmd_buf[32];
     int len = snprintf(cmd_buf, sizeof(cmd_buf), "TIM:%d\n", idx);
-    // [修复] 消除 warning: ignoring return value of ‘write’
     if (write(serial_fd, cmd_buf, len) != len) {
-        // 可以在这里处理错误，或者直接忽略
     }
     for (int i = 0; i < SCREEN_WIDTH; i++) data_buffer[i] = 0;
 }
@@ -296,26 +307,22 @@ uint8_t rx_buffer[FRAME_SIZE * 2];
 int rx_len = 0;
 
 int main(int argc, char* argv[]) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) return 1; // [修改] 增加音频初始化
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) return 1;
     SDL_ShowCursor(SDL_DISABLE); 
     SDL_EnableKeyRepeat(300, 30);
     SDL_Surface* screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, 16, SDL_SWSURFACE);
     
-    // [新增] 初始化音频
     if (Audio_Init("key_sound.wav") != 0) {
         printf("Warning: Audio init failed. Ensure key_sound.wav exists.\n");
     }
 
-    // [新增] 初始化小人资源
     if (Pusher_Init() != 0) {
         printf("Pusher Init Failed (check walk.bmp)\n");
     }
 
-
     int running = 1;
     for (int i = 0; i < SCREEN_WIDTH; i++) data_buffer[i] = 0;
 
-    // [新增] 按键状态数组，用于过滤长按重复音效
     Uint8 key_press_flags[SDLK_LAST];
     memset(key_press_flags, 0, sizeof(key_press_flags));
 
@@ -324,20 +331,16 @@ int main(int argc, char* argv[]) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) running = 0;
             
-            // --- [新增] 全局音效与长按过滤逻辑 ---
             if (event.type == SDL_KEYDOWN) {
-                // 如果该键之前未按下（防止长按重复触发），则播放
                 if (event.key.keysym.sym < SDLK_LAST && key_press_flags[event.key.keysym.sym] == 0) {
                     Audio_Play();
-                    key_press_flags[event.key.keysym.sym] = 1; // 标记为按下
+                    key_press_flags[event.key.keysym.sym] = 1;
                 }
             } else if (event.type == SDL_KEYUP) {
-                // 松开按键，重置标志位
                 if (event.key.keysym.sym < SDLK_LAST) {
                     key_press_flags[event.key.keysym.sym] = 0;
                 }
             }
-            // ------------------------------------
 
             if (state.show_exit_dialog) {
                 if (event.type == SDL_KEYDOWN) {
@@ -379,10 +382,9 @@ int main(int argc, char* argv[]) {
                     int* target = NULL;
                     int step = 1;
                     
-                    // [新增] 用于小人推动的变量
-                    int moved = 0;      // 标记是否移动
-                    int move_delta = 0; // 移动距离
-                    CursorType move_type = CURSOR_TYPE_X; // 移动的光标类型
+                    int moved = 0;      
+                    int move_delta = 0; 
+                    CursorType move_type = CURSOR_TYPE_X; 
 
                     if (state.active_cursor == 0) { target = &state.cursor_x1; move_type = CURSOR_TYPE_X; }
                     else if (state.active_cursor == 1) { target = &state.cursor_x2; move_type = CURSOR_TYPE_X; }
@@ -402,7 +404,6 @@ int main(int argc, char* argv[]) {
                         *target += step; moved = 1; move_delta = step;
                     }
                     
-                    // [新增] 如果发生了移动，通知小人模块
                     if (moved) {
                         Pusher_OnMove(move_type, *target, move_delta);
                     }
@@ -468,9 +469,7 @@ int main(int argc, char* argv[]) {
         SDL_Delay(10);
     }
     
-    // [新增] 释放小人资源
     Pusher_Cleanup();
-    // [新增] 释放音频资源
     Audio_Cleanup();
     
     if (serial_fd != -1) serial_close(serial_fd);
